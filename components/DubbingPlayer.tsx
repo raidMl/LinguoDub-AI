@@ -12,7 +12,10 @@ const DubbingPlayer: React.FC<DubbingPlayerProps> = ({ videoDataUrl, script, spe
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [currentLine, setCurrentLine] = useState<ScriptLine | null>(null);
+  const [isExporting, setIsExporting] = useState(false);
+  
   const audioContextRef = useRef<AudioContext | null>(null);
+  const masterGainRef = useRef<GainNode | null>(null);
   const activeSourcesRef = useRef<Map<string, AudioBufferSourceNode>>(new Map());
   
   const isAudioFile = videoDataUrl.startsWith('data:audio');
@@ -21,9 +24,18 @@ const DubbingPlayer: React.FC<DubbingPlayerProps> = ({ videoDataUrl, script, spe
   const getSpeaker = (id: string) => speakers.find(s => s.id === id);
 
   useEffect(() => {
-    audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
+    const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
+    const ctx = new AudioContextClass();
+    audioContextRef.current = ctx;
+
+    // Create a master gain node to route all audio through
+    // This is crucial for capturing the audio stream during export
+    const masterGain = ctx.createGain();
+    masterGain.connect(ctx.destination);
+    masterGainRef.current = masterGain;
+
     return () => {
-      audioContextRef.current?.close();
+      ctx.close();
     };
   }, []);
 
@@ -54,7 +66,7 @@ const DubbingPlayer: React.FC<DubbingPlayerProps> = ({ videoDataUrl, script, spe
   };
 
   const playAudioForLine = (line: ScriptLine) => {
-    if (!line.audioData || !audioContextRef.current) return;
+    if (!line.audioData || !audioContextRef.current || !masterGainRef.current) return;
     
     // Avoid overlapping plays of same line if user scrubs
     if (activeSourcesRef.current.has(line.id)) return;
@@ -67,11 +79,12 @@ const DubbingPlayer: React.FC<DubbingPlayerProps> = ({ videoDataUrl, script, spe
       source.buffer = audioBuffer;
       
       // Connect to gain node for volume control
-      const gainNode = audioContextRef.current.createGain();
-      gainNode.gain.value = 1.0; // Full volume
+      const lineGain = audioContextRef.current.createGain();
+      lineGain.gain.value = 1.0; // Full volume
       
-      source.connect(gainNode);
-      gainNode.connect(audioContextRef.current.destination);
+      source.connect(lineGain);
+      // Connect to master gain instead of destination directly
+      lineGain.connect(masterGainRef.current);
       
       source.start(0);
       activeSourcesRef.current.set(line.id, source);
@@ -99,7 +112,9 @@ const DubbingPlayer: React.FC<DubbingPlayerProps> = ({ videoDataUrl, script, spe
     script.forEach(line => {
         const timeDiff = time - line.startTime;
         // If we are within 0.25s of the start time and the line has audio
-        if (timeDiff >= 0 && timeDiff < 0.25 && isPlaying) {
+        // When exporting, we increase tolerance slightly to ensure no drops
+        const tolerance = isExporting ? 0.3 : 0.25;
+        if (timeDiff >= 0 && timeDiff < tolerance && (isPlaying || isExporting)) {
            playAudioForLine(line);
         }
     });
@@ -135,8 +150,110 @@ const DubbingPlayer: React.FC<DubbingPlayerProps> = ({ videoDataUrl, script, spe
     }
   };
 
+  const handleExport = async () => {
+    if (!videoRef.current || !audioContextRef.current || !masterGainRef.current) return;
+    
+    setIsExporting(true);
+    // Ensure audio context is running
+    if (audioContextRef.current.state === 'suspended') {
+      await audioContextRef.current.resume();
+    }
+
+    // 1. Setup Recording Streams
+    const streamDestination = audioContextRef.current.createMediaStreamDestination();
+    masterGainRef.current.connect(streamDestination);
+
+    // Get video stream (handling cross-browser prefixes)
+    const videoEl = videoRef.current as any;
+    const videoStream = videoEl.captureStream ? videoEl.captureStream() : videoEl.mozCaptureStream ? videoEl.mozCaptureStream() : null;
+
+    if (!videoStream) {
+      alert("Video export is not supported in your browser. Please try Chrome or Edge.");
+      setIsExporting(false);
+      masterGainRef.current.disconnect(streamDestination);
+      return;
+    }
+
+    // Combine Video + Audio
+    const combinedStream = new MediaStream([
+      ...videoStream.getVideoTracks(),
+      ...streamDestination.stream.getAudioTracks()
+    ]);
+
+    // 2. Setup MediaRecorder
+    const mimeTypes = [
+      "video/webm;codecs=vp9,opus",
+      "video/webm;codecs=vp8,opus",
+      "video/webm"
+    ];
+    const validMime = mimeTypes.find(type => MediaRecorder.isTypeSupported(type)) || "";
+
+    if (!validMime) {
+       alert("No supported recording formats found.");
+       setIsExporting(false);
+       return;
+    }
+
+    const recorder = new MediaRecorder(combinedStream, { mimeType: validMime });
+    const chunks: Blob[] = [];
+
+    recorder.ondataavailable = (e) => {
+      if (e.data.size > 0) chunks.push(e.data);
+    };
+
+    recorder.onstop = () => {
+      const blob = new Blob(chunks, { type: validMime });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `dubbed_video_${Date.now()}.webm`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      
+      // Cleanup
+      masterGainRef.current?.disconnect(streamDestination);
+      setIsExporting(false);
+      setIsPlaying(false);
+      // Reset video to start
+      videoRef.current!.currentTime = 0;
+    };
+
+    // 3. Start Process
+    // Move to start
+    videoRef.current.currentTime = 0;
+    // Wait a tiny bit for seek
+    await new Promise(r => setTimeout(r, 100));
+
+    recorder.start();
+    videoRef.current.play();
+    setIsPlaying(true);
+
+    // Stop when video ends
+    videoRef.current.onended = () => {
+      if (recorder.state === "recording") {
+        recorder.stop();
+      }
+      // Restore normal onended behavior
+      videoRef.current!.onended = () => setIsPlaying(false);
+    };
+  };
+
   return (
-    <div className="w-full max-w-5xl mx-auto bg-black rounded-2xl overflow-hidden shadow-2xl border border-slate-800">
+    <div className="w-full max-w-5xl mx-auto bg-black rounded-2xl overflow-hidden shadow-2xl border border-slate-800 relative">
+      
+      {/* Export Overlay */}
+      {isExporting && (
+        <div className="absolute inset-0 z-50 bg-black/80 backdrop-blur-sm flex flex-col items-center justify-center text-center p-8">
+          <div className="w-16 h-16 border-4 border-slate-700 border-t-primary-500 rounded-full animate-spin mb-6"></div>
+          <h3 className="text-2xl font-bold text-white mb-2">Rendering Video...</h3>
+          <p className="text-slate-400 max-w-md">
+            We are recording the dubbed playback in real-time to ensure synchronization. 
+            <br/><span className="text-yellow-500">Please do not close this tab.</span>
+          </p>
+        </div>
+      )}
+
       <div className="relative aspect-video bg-black group">
         {/* Audio Visualization Background (if audio file) */}
         {isAudioFile && (
@@ -153,7 +270,6 @@ const DubbingPlayer: React.FC<DubbingPlayerProps> = ({ videoDataUrl, script, spe
         )}
 
         {/* Video Element - MUTED because we play dubbed audio */}
-        {/* Using <video> tag even for audio files works in most browsers to provide timing/seeking logic easily */}
         <video
           ref={videoRef}
           src={videoDataUrl}
@@ -161,12 +277,15 @@ const DubbingPlayer: React.FC<DubbingPlayerProps> = ({ videoDataUrl, script, spe
           muted
           playsInline
           onTimeUpdate={handleTimeUpdate}
-          onEnded={() => setIsPlaying(false)}
+          onEnded={() => {
+              if(!isExporting) setIsPlaying(false);
+          }}
+          crossOrigin="anonymous"
         />
 
         {/* Subtitle Overlay */}
         {currentLine && (
-           <div className="absolute bottom-16 left-0 right-0 flex justify-center pointer-events-none px-4">
+           <div className="absolute bottom-16 left-0 right-0 flex justify-center pointer-events-none px-4 z-20">
              <div className="bg-black/60 backdrop-blur-sm px-6 py-3 rounded-lg text-center max-w-3xl animate-in fade-in slide-in-from-bottom-2 duration-200">
                <p className="text-yellow-400 text-sm font-bold mb-1 uppercase tracking-wider">
                  {getSpeaker(currentLine.speakerId)?.name}
@@ -179,7 +298,7 @@ const DubbingPlayer: React.FC<DubbingPlayerProps> = ({ videoDataUrl, script, spe
         )}
 
         {/* Controls Overlay (Visible on hover or paused) */}
-        <div className={`absolute inset-0 bg-gradient-to-t from-black/80 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-300 flex flex-col justify-end p-6 ${!isPlaying ? 'opacity-100' : ''}`}>
+        <div className={`absolute inset-0 bg-gradient-to-t from-black/80 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-300 flex flex-col justify-end p-6 z-30 ${!isPlaying ? 'opacity-100' : ''}`}>
             
             {/* Progress Bar */}
             <div className="w-full mb-4 flex items-center gap-3">
@@ -193,7 +312,8 @@ const DubbingPlayer: React.FC<DubbingPlayerProps> = ({ videoDataUrl, script, spe
                     step="0.1"
                     value={currentTime}
                     onChange={handleSeek}
-                    className="w-full h-1 bg-slate-600 rounded-lg appearance-none cursor-pointer accent-primary-500 hover:h-2 transition-all"
+                    disabled={isExporting}
+                    className="w-full h-1 bg-slate-600 rounded-lg appearance-none cursor-pointer accent-primary-500 hover:h-2 transition-all disabled:opacity-50"
                 />
                 <span className="text-xs font-mono text-slate-300 w-12">
                     {videoRef.current?.duration.toFixed(1) || '0.0'}s
@@ -201,13 +321,31 @@ const DubbingPlayer: React.FC<DubbingPlayerProps> = ({ videoDataUrl, script, spe
             </div>
 
             {/* Buttons */}
-            <div className="flex justify-center gap-6">
+            <div className="flex justify-between items-center">
+                <div className="w-20"></div> {/* Spacer to center play button */}
+                
                 <button 
                     onClick={togglePlay}
-                    className="w-14 h-14 bg-white text-black rounded-full flex items-center justify-center hover:scale-110 transition transform shadow-lg"
+                    disabled={isExporting}
+                    className="w-14 h-14 bg-white text-black rounded-full flex items-center justify-center hover:scale-110 transition transform shadow-lg disabled:opacity-50 disabled:hover:scale-100"
                 >
                     <i className={`fas ${isPlaying ? 'fa-pause' : 'fa-play'} text-xl ml-1`}></i>
                 </button>
+
+                {/* Download Button */}
+                <div className="w-20 flex justify-end">
+                    <button 
+                      onClick={handleExport}
+                      disabled={isExporting}
+                      className="group relative w-10 h-10 flex items-center justify-center rounded-full bg-slate-800/80 hover:bg-primary-500 text-white transition-all"
+                      title="Export Video"
+                    >
+                      <i className="fas fa-download"></i>
+                      <span className="absolute right-0 -top-10 bg-white text-slate-900 text-xs font-bold px-2 py-1 rounded opacity-0 group-hover:opacity-100 transition-opacity whitespace-nowrap pointer-events-none">
+                         Download Video
+                      </span>
+                    </button>
+                </div>
             </div>
         </div>
       </div>
