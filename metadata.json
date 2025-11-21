@@ -1,0 +1,5 @@
+{
+  "name": "LinguoDub AI",
+  "description": "A professional AI video dubbing studio. Detects speakers, translates dialogue, and re-synthesizes voices in different languages while preserving character distinction.",
+  "requestFramePermissions": []
+}
