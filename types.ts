@@ -46,6 +46,7 @@ export const SUPPORTED_LANGUAGES = [
   { code: 'ja', name: 'Japanese' },
   { code: 'ko', name: 'Korean' },
   { code: 'hi', name: 'Hindi' },
+  { code: 'ar', name: 'Arabic' },
   { code: 'en', name: 'English' },
 ];
 
